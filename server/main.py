@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
+from datetime import datetime, timedelta
 from pydantic import BaseModel
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
@@ -67,6 +68,9 @@ class InventoryItem(BaseModel):
     unit_cost: float
     location: str
     last_updated: str
+    # Days the supplier needs to deliver this SKU; used by Restocking to filter recommendations
+    # by selected order lead time. Default applies to legacy data without the field.
+    supplier_lead_days: int = 14
 
 class Order(BaseModel):
     id: str
@@ -120,6 +124,16 @@ class CreatePurchaseOrderRequest(BaseModel):
     expected_delivery_date: str
     notes: Optional[str] = None
 
+class RestockOrderItem(BaseModel):
+    sku: str
+    name: str
+    quantity: int
+    unit_price: float
+
+class CreateRestockOrderRequest(BaseModel):
+    items: List[RestockOrderItem]
+    lead_time_days: int
+
 # API endpoints
 @app.get("/")
 def root():
@@ -152,6 +166,43 @@ def get_orders(
     filtered_orders = apply_filters(orders, warehouse, category, status)
     filtered_orders = filter_by_month(filtered_orders, month)
     return filtered_orders
+
+@app.post("/api/restock-orders", response_model=Order)
+def create_restock_order(req: CreateRestockOrderRequest):
+    """Create a restocking order. Appends to in-memory orders with status='Submitted'."""
+    if not req.items:
+        raise HTTPException(status_code=400, detail="No items provided")
+    if req.lead_time_days not in (7, 14, 21, 30):
+        raise HTTPException(status_code=400, detail="lead_time_days must be 7, 14, 21, or 30")
+
+    # Sequence next RST order number based on existing RST-prefixed entries
+    existing_rst = [o for o in orders if o.get("order_number", "").startswith("RST-")]
+    next_seq = len(existing_rst) + 1
+    year = datetime.utcnow().year
+    order_number = f"RST-{year}-{next_seq:04d}"
+
+    now = datetime.utcnow()
+    expected_delivery = now + timedelta(days=req.lead_time_days)
+    items_dicts = [item.model_dump() for item in req.items]
+    total_value = sum(item.quantity * item.unit_price for item in req.items)
+    new_id = str(max((int(o["id"]) for o in orders if o.get("id", "").isdigit()), default=0) + 1)
+
+    new_order = {
+        "id": new_id,
+        "order_number": order_number,
+        "customer": "Internal Restock",
+        "items": items_dicts,
+        "status": "Submitted",
+        # ISO 8601 with seconds — matches existing orders.json format
+        "order_date": now.strftime("%Y-%m-%dT%H:%M:%S"),
+        "expected_delivery": expected_delivery.strftime("%Y-%m-%dT%H:%M:%S"),
+        "total_value": round(total_value, 2),
+        "actual_delivery": None,
+        "warehouse": None,
+        "category": None,
+    }
+    orders.append(new_order)
+    return new_order
 
 @app.get("/api/orders/{order_id}", response_model=Order)
 def get_order(order_id: str):
